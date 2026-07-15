@@ -1,0 +1,24 @@
+# -*- coding: utf-8 -*-
+# SConscript for src/accelerators/ - NPU/LPU/ISP accelerator models.
+#
+# Drop this whole directory (src/accelerators/) into your gem5 checkout
+# and gem5's build system (SCons) will pick it up automatically, since
+# gem5's top-level SConstruct walks src/ looking for SConscript files.
+# No changes to any other build file are required for the C++/Python
+# pieces below. (The optional SE-mode syscall shim is a separate, small
+# patch - see docs/INTEGRATION.md.)
+
+Import("*")
+
+SimObject("AccelBase.py", sim_objects=["AccelBase"])
+SimObject("NpuAccel.py", sim_objects=["NpuAccel"])
+SimObject("LpuAccel.py", sim_objects=["LpuAccel"])
+SimObject("IspAccel.py", sim_objects=["IspAccel"])
+
+Source("accel_base.cc")
+Source("npu_accel.cc")
+Source("lpu_accel.cc")
+Source("isp_accel.cc")
+
+DebugFlag("Accel", "Company accelerator (NPU/LPU/ISP) control-plane and "
+                    "DMA/compute FSM debug messages")
