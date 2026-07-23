@@ -1,0 +1,6 @@
+Import('*')
+
+SimObject('NpuSimObject.py', sim_objects=['NpuSimObject'])
+Source('npu_csr_registry.cc')
+Source('npu_sim_object.cc')
+DebugFlag('NpuSimObject')
