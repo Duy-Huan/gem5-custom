@@ -1,0 +1,95 @@
+@startuml
+skinparam componentStyle uml2
+skinparam linetype ortho
+skinparam shadowing false
+skinparam defaultFontName sans-serif
+skinparam defaultTextAlignment center
+skinparam nodesep 50
+skinparam ranksep 40
+
+' Định dạng khung ngoài Client Subsystem
+skinparam package {
+    BackgroundColor Transparent
+    BorderColor #333333
+    BorderThickness 2
+    FontSize 18
+    FontStyle bold
+}
+
+' Định dạng các Sub-module lớn
+skinparam rectangle {
+    RoundCorner 8
+    BorderThickness 1.5
+    BorderColor #555555
+    FontSize 15
+    FontStyle bold
+}
+
+' Định dạng các khối linh kiện chi tiết
+skinparam component {
+    RoundCorner 4
+    BorderThickness 1
+    BorderColor #777777
+    BackgroundColor #FFFFFF
+    FontSize 14
+}
+
+' ==========================================
+' EXTERNAL INTERFACES
+' ==========================================
+interface "CPU Pipeline / RoCC\n(Custom Instructions)" as P_CPU_PIPE #F4B183
+interface "CPU Stall / Interlock\n(Flow Control)" as P_CPU_STALL #FF7F50
+interface "CPU Register File Writeback\n(rd / data)" as P_CPU_WB #F4B183
+interface "System Interconnect / NoC\n(RoCC Packets to Manager)" as P_SYS_BUS #F4B183
+
+' ==========================================
+' CLIENT TRACKER INTERNAL STRUCTURE
+' ==========================================
+package "AuRORA Client Tracker (Host Side)" {
+
+    ' Khối Giao tiếp & Giải mã lệnh phía CPU
+    rectangle "CPU Front-End Interface" as CPU_FE #E8F8F5 {
+        component "RoCC Instruction Queue\n(Command Buffer)" as CmdBuf
+        component "RoCC Decoder &\nPacket Formatter" as Dispatcher
+        
+        CmdBuf -down-> Dispatcher : " Raw RoCC Op"
+    }
+
+    ' Khối Theo dõi Task & Ngữ cảnh
+    rectangle "Task & Context Tracking Engine" as TRACKER #FCF3CF {
+        component "Outstanding Tx Tracker\n(Transaction ID Table)" as TxTracker
+        component "Client Context Register\n(ASID / Tenant State)" as TenantState
+        component "Fence & Sync Manager\n(Stall & Wait Logic)" as SyncMgr
+    }
+
+    ' Khối Xử lý Phản hồi & Writeback
+    rectangle "Response & Writeback Logic" as WB_ENG #EAECEE {
+        component "Response Unpacker\n& FIFO" as RespFIFO
+        component "Register File Arbiter\n(Writeback Controller)" as WBArbiter
+        
+        RespFIFO -right-> WBArbiter
+    }
+
+    ' ------------------------------------------
+    ' INTERNAL ROUTING (Đường điều khiển nội bộ)
+    ' ------------------------------------------
+    Dispatcher -down-> TxTracker : " Register New Tx"
+    Dispatcher -right-> P_SYS_BUS : " Marshal & Send Packet\n(to AuRORA Manager)"
+    
+    ' Cơ chế đồng bộ Fence & Stall CPU
+    SyncMgr -up-> P_CPU_STALL : " Assert Stall\n(nếu Queue đầy / Fencing)"
+    TxTracker -right-> SyncMgr : " Check Pending Count == 0"
+    SyncMgr -up-> Dispatcher : " Resume Pipeline"
+
+    ' Xử lý Response từ Manager về CPU
+    P_SYS_BUS -down-> RespFIFO : " Receive Ack / Counter Data"
+    WBArbiter -up-> P_CPU_WB : " Writeback rd"
+}
+
+' ==========================================
+' EXTERNAL CONNECTIONS
+' ==========================================
+P_CPU_PIPE -down-> CmdBuf : " RoCC Cmd"
+P_SYS_BUS -up-> TxTracker : " Response Match"
+
+@enduml
