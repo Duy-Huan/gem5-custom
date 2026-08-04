@@ -35,14 +35,14 @@ skinparam component {
 }
 
 ' ==========================================
-' EXTERNAL INTERFACES (Cổng giao tiếp hệ thống)
+' EXTERNAL INTERFACES
 ' ==========================================
-interface "io.cmd\n(Từ AuRORA Manager)" as P_CMD #F4B183
-interface "io.busy\n(Tới AuRORA Manager)" as P_BUSY #FF7F50
-interface "io.resp\n(Tới AuRORA Manager)" as P_RESP #F4B183
+interface "io.cmd\n(RoCC Command)" as P_CMD #F4B183
+interface "io.busy\n(Aggregated Busy Status)" as P_BUSY #FF7F50
+interface "io.resp\n(Counter Writeback rd)" as P_RESP #F4B183
 
-interface "io.ptw\n(Tới Hardware MMU)" as P_PTW #F4B183
-interface "io.mem\n(TileLink DMA Interconnect)" as P_MEM #F4B183
+interface "io.ptw\n(L1 TLB Miss Walk)" as P_PTW #F4B183
+interface "io.mem\n(TileLink DMA)" as P_MEM #F4B183
 
 ' ==========================================
 ' GEMMINI ACCELERATOR INTERNAL STRUCTURE
@@ -51,73 +51,78 @@ package "Gemmini Accelerator" {
 
     ' Khối Điều khiển Frontend (Controller)
     rectangle "Controller & Frontend" as CTRL #E8F8F5 {
-        component "Loop Unroller\n(Sinh Micro-ops / Decode)" as Unroller
+        component "Loop Unroller\n(Command Dispatcher)" as Unroller
         
-        component "Reservation Station\n(ld_q | ex_q | st_q)" as DepMgmt
+        component "Reservation Station\n(ld_q | ex_q | st_q\n+ Dependency Logic)" as DepMgmt
         
-        component "DMA Engine\n(Load / Store Ctrl)" as DMA
-        component "Local TLB\n(Shared, Size=4)" as L1TLB
+        component "DMA Engine\n(Load/Store Controllers)" as DMA
+        component "Local L1 TLB\n(Shared Size=4)" as L1TLB
         
         Unroller -down-> DepMgmt : " Push Micro-ops"
         DepMgmt -down-> DMA : " Issue Load/Store"
-        DMA <-right-> L1TLB : " VA -> PA"
+        DMA <-right-> L1TLB : " VA -> PA Translation"
         
         ' Tín hiệu Flush L1 TLB khi nhận FLUSH_CMD từ Manager
         Unroller -right-> L1TLB : " Flush (SFENCE.VMA)"
     }
 
-    ' Khối Tính toán (Execution Engine)
-    rectangle "Execution Engine" as ENGINE #FCF3CF {
-        component "Transposer" as Transposer
-        component "Systolic Array\n(16x16 PEs)" as Mesh
-        
-        Transposer -down-> Mesh : " Dataflow"
+    ' Khối Tính toán & Biến đổi (Execution & Transposer)
+    rectangle "Execution & Data Transformation" as ENGINE #FCF3CF {
+        component "Transposer Unit\n(Matrix Reordering)" as Transposer
+        component "Systolic Array\n(16x16 PEs Mesh)" as Mesh
     }
 
-    ' Khối Bộ nhớ cục bộ (Storage & Formatting)
-    rectangle "Local Storage / Memory" as STORAGE #EAECEE {
-        component "Scratchpad\n(Bank 0 ... Bank K)" as SPAD
+    ' Khối Bộ nhớ cục bộ (Storage & Formatting Pipeline)
+    rectangle "Local Storage & Pipelines" as STORAGE #EAECEE {
+        component "Scratchpad SRAM\n(Bank 0 ... Bank K)" as SPAD
         
         rectangle "Accumulator Subsystem" as ACC_SUB #FFFFFF {
-            component "Accumulator SRAM" as ACC
-            component "ReLU (Activation)" as RELU
-            component "Scaling" as SCALE
+            component "Accumulator SRAM\n(Partial Sums D)" as ACC
+            component "ReLU Activation" as RELU
+            component "Scaling Unit" as SCALE
             
-            ACC -right-> RELU : " Đọc (Compute/Store)"
+            ACC -right-> RELU : " Pipeline Read"
             RELU -right-> SCALE
         }
     }
 
     ' ------------------------------------------
-    ' INTERNAL ROUTING (Luồng dữ liệu & Điều khiển)
+    ' INTERNAL ROUTING (Đường đi dữ liệu tinh chỉnh)
     ' ------------------------------------------
     
-    ' Lệnh Execute
-    DepMgmt -right-> Transposer : " Issue Ex"
+    ' Lệnh Execute đi xuống Systolic Array
+    DepMgmt -right-> Mesh : " Issue Execute Ops"
     
-    ' Luồng DMA Load (mvin)
-    DMA -down-> SPAD : " mvin (A,B)"
-    DMA -down-> ACC : " mvin (D)"
+    ' Transposer hỗ trợ luồng dữ liệu vào Scratchpad / Array
+    SPAD <--> Transposer : " Data Reordering"
+    Transposer --> Mesh
     
-    ' Luồng DMA Store (mvout)
-    SCALE -up-> DMA : " mvout Pipeline"
-    SPAD -up-> DMA : " mvout"
+    ' Luồng DMA Load (mvin) rẽ nhánh linh hoạt
+    DMA -down-> SPAD : " mvin -> Scratchpad (A,B)"
+    DMA -down-> ACC : " mvin -> Accumulator (D)"
     
-    ' Luồng Systolic Array (Execute)
-    Mesh <-left-> SPAD : " Đọc Operands A, B\n Ghi/Đọc kết quả"
-    Mesh <-down-> ACC : " Đọc/Ghi Partial Sums"
+    ' Luồng DMA Store (mvout) qua Pipeline ReLU/Scaling
+    SCALE -up-> DMA : " mvout (Processed Data)"
+    SPAD -up-> DMA : " mvout (Raw Data)"
+    
+    ' Luồng Systolic Array tính toán với Bộ nhớ
+    Mesh <-left-> SPAD : " Read Operands A, B"
+    Mesh <-down-> ACC : " Read/Write Partial Sums D"
 
-    ' Luồng giám sát trạng thái về Manager
-    DepMgmt -up-> P_BUSY : " Compute/Q Busy"
-    Unroller -up-> P_BUSY : " Unroll Busy"
-    DepMgmt -up-> P_RESP : " COUNTER_OP"
+    ' Tổng hợp tín hiệu Trạng thái (io.busy logic)
+    Unroller -up-> P_BUSY : " Unroller Active"
+    DepMgmt -up-> P_BUSY : " Queues / Solitary Preload"
+    DMA -up-> P_BUSY : " DMA In-flight"
+    DepMgmt -up-> P_RESP : " COUNTER_OP Result"
 }
 
 ' ==========================================
-' EXTERNAL CONNECTIONS (Đi dây ra ngoài)
+' EXTERNAL CONNECTIONS
 ' ==========================================
-P_CMD -down-> Unroller : " Lệnh RoCC"
-L1TLB -up-> P_PTW : " TLB Miss / Walk"
-DMA -up-> P_MEM : " TileLink Req/Resp (Trực tiếp RAM/L2)"
+P_CMD -down-> Unroller : " RoCC Cmd Stream"
+L1TLB -up-> P_PTW : " TLB Miss / PTW"
+DMA -up-> P_MEM : " TileLink Requests"
+
+@endregion
 
 @enduml
