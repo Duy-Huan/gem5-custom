@@ -1,0 +1,99 @@
+@startuml
+skinparam componentStyle uml2
+skinparam linetype ortho
+skinparam shadowing false
+skinparam defaultFontName sans-serif
+skinparam defaultTextAlignment center
+skinparam nodesep 50
+skinparam ranksep 40
+
+' Định dạng khung ngoài Subsystem
+skinparam package {
+    BackgroundColor Transparent
+    BorderColor #333333
+    BorderThickness 2
+    FontSize 18
+    FontStyle bold
+}
+
+' Định dạng các Sub-module lớn
+skinparam rectangle {
+    RoundCorner 8
+    BorderThickness 1.5
+    BorderColor #555555
+    FontSize 15
+    FontStyle bold
+}
+
+' Định dạng các khối linh kiện chi tiết
+skinparam component {
+    RoundCorner 4
+    BorderThickness 1
+    BorderColor #777777
+    BackgroundColor #FFFFFF
+    FontSize 14
+}
+
+' ==========================================
+' EXTERNAL INTERFACES & PORTS
+' ==========================================
+interface "CPU Pipeline / Register File\n(gem5 TimingSimpleCPU Base)" as P_CPU_CORE #F4B183
+interface "CPU Stall / Interlock\n(Pipeline Flow Control)" as P_CPU_STALL #FF7F50
+
+interface "RoCCCmd Port\n(MasterPort - Send Commands)" as P_ROCC_CMD #4A90E2
+interface "RoCCResp Port\n(Port - Receive ACKs/Data)" as P_ROCC_RESP #50E3C2
+
+interface "System Interconnect / NoC\n(To AuRORA Manager)" as P_SYS_BUS #F4B183
+
+' ==========================================
+' CUSTOM RISC-V CPU ARCHITECTURE
+' ==========================================
+package "Custom RISC-V CPU (TimingSimpleCPU Extended)" {
+
+    ' Khối Pipeline cơ sở từ gem5
+    rectangle "Base CPU Pipeline" as BASE_CPU #E8F8F5 {
+        component "Fetch / Decode / Execute\n(gem5 TimingSimpleCPU Core)" as CorePipeline
+        component "Architectural Register File\n(Integer / rd / Vector)" as RegFile
+    }
+
+    ' Khối Client Tracker & Quản lý giao dịch
+    rectangle "AuRORA Client Tracker Subsystem" as TRACKER_SUB #FCF3CF {
+        component "RoCC Instruction Queue\n(Command Buffer)" as CmdBuf
+        component "RoCC Decoder &\nPacket Formatter" as Dispatcher
+        
+        component "Outstanding Tx Tracker\n(Transaction ID Table)" as TxTracker
+        component "Fence & Sync Manager\n(Stall & Wait Logic)" as SyncMgr
+        
+        component "Response Unpacker\n& FIFO" as RespFIFO
+        component "Register File Arbiter\n(Writeback Controller)" as WBArbiter
+    }
+
+    ' ------------------------------------------
+    ' INTERNAL ROUTING (Đường đi tín hiệu nội bộ)
+    ' ------------------------------------------
+    CorePipeline -down-> CmdBuf : " Custom RoCC Ops\n(custom0 - custom3)"
+    CmdBuf -down-> Dispatcher : " Raw RoCC Instruction"
+    Dispatcher -down-> TxTracker : " Register New Tx\n(Increment Pending)"
+    
+    ' Cơ chế Stall / Interlock pipeline CPU
+    SyncMgr -up-> P_CPU_STALL : " Assert Stall / freeze(tickEvent)\n(Queue Full / Fence Active)"
+    TxTracker -right-> SyncMgr : " Check Pending Count == 0"
+    SyncMgr -up-> CorePipeline : " Resume Pipeline / Unfreeze"
+
+    ' Định tuyến qua 2 cổng RoCC riêng biệt
+    Dispatcher -right-> P_ROCC_CMD : " sendTimingReq()\n(RoCCCmd MasterPort)"
+    P_ROCC_RESP -left-> RespFIFO : " recvTimingResp()\n(RoCCResp Port)"
+    
+    ' Luồng Writeback trả kết quả về CPU Register File
+    RespFIFO -down-> WBArbiter
+    WBArbiter -up-> RegFile : " Writeback rd / Data"
+}
+
+' ==========================================
+' EXTERNAL CONNECTIONS
+' ==========================================
+P_CPU_CORE -down-> CorePipeline
+P_ROCC_CMD -right-> P_SYS_BUS : " RoCC Command Packets"
+P_SYS_BUS -left-> P_ROCC_RESP : " ACKs / Response Packets"
+
+@enduml
