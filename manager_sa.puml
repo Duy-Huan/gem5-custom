@@ -1,0 +1,108 @@
+@startuml
+skinparam componentStyle uml2
+skinparam linetype ortho
+skinparam shadowing false
+skinparam defaultFontName sans-serif
+skinparam defaultTextAlignment center
+skinparam nodesep 50
+skinparam ranksep 40
+
+' Định dạng khung ngoài Manager
+skinparam package {
+    BackgroundColor Transparent
+    BorderColor #333333
+    BorderThickness 2
+    FontSize 18
+    FontStyle bold
+}
+
+' Định dạng các Sub-module lớn
+skinparam rectangle {
+    RoundCorner 8
+    BorderThickness 1.5
+    BorderColor #555555
+    FontSize 15
+    FontStyle bold
+}
+
+' Định dạng các khối linh kiện chi tiết
+skinparam component {
+    RoundCorner 4
+    BorderThickness 1
+    BorderColor #777777
+    BackgroundColor #FFFFFF
+    FontSize 14
+}
+
+' ==========================================
+' EXTERNAL INTERFACES
+' ==========================================
+' 1. Giao tiếp phía Host CPU
+interface "Host RoCC Cmd\n(Từ CPU Core)" as P_HOST_CMD #F4B183
+interface "Host Resp / Writeback\n(Tới CPU rd)" as P_HOST_RESP #F4B183
+
+' 2. Giao tiếp phía Hardware MMU (Tenant Shared)
+interface "MMU Context Config\n(ASID / PTBR Update)" as P_MMU_CFG #F4B183
+
+' 3. Giao tiếp phía Gemmini Accelerator
+interface "io.cmd\n(Tới Gemmini Unroller)" as P_GEM_CMD #F4B183
+interface "io.busy\n(Từ Gemmini Status)" as P_GEM_BUSY #FF7F50
+interface "io.resp\n(Từ Gemmini Counter)" as P_GEM_RESP #F4B183
+
+' ==========================================
+' AURORA MANAGER INTERNAL STRUCTURE
+' ==========================================
+package "AuRORA Manager Subsystem" {
+
+    ' Khối Giao tiếp & Giải mã lệnh Frontend
+    rectangle "Frontend & Command Decoder" as FRONTEND #E8F8F5 {
+        component "Instruction Buffer\n(Depth=4 FIFO)" as InstBuf
+        component "RoCC Command Decoder\n& Dispatcher" as CmdDecoder
+        
+        InstBuf -down-> CmdDecoder : " Raw RoCC Cmd"
+    }
+
+    ' Khối Quản lý Ngữ cảnh & Đồng bộ Trạng thái (Control Plane)
+    rectangle "Context & Synchronization Engine" as CTX_ENG #FCF3CF {
+        component "Tenant Context Manager\n(ASID / PTBR Tracker)" as CtxMgr
+        component "Fence & Status Monitor\n(io.busy Sampler)" as StatusMon
+        component "SFENCE / Flush Coordinator\n(TLB Invalidation)" as FlushCoord
+    }
+
+    ' Khối Định tuyến Phản hồi (Response Router)
+    rectangle "Response & Writeback Logic" as RESP_ENG #EAECEE {
+        component "Writeback Arbiter\n(Counter / Status)" as WBArbiter
+    }
+
+    ' ------------------------------------------
+    ' INTERNAL ROUTING (Đường điều khiển nội bộ)
+    ' ------------------------------------------
+    
+    ' Phân phối lệnh từ Decoder
+    CmdDecoder -down-> CtxMgr : " Config Context Cmd\n(ASID/PTBR update)"
+    CmdDecoder -right-> FlushCoord : " Catch SFENCE.VMA"
+    CmdDecoder -down-> P_GEM_CMD : " Forward io.cmd\n(Standard Ops)"
+
+    ' Cập nhật cấu hình sang Hardware MMU
+    CtxMgr -right-> P_MMU_CFG : " Update MMU State"
+
+    ' Quản lý Fence & Busy
+    P_GEM_BUSY -up-> StatusMon : " Poll io.busy"
+    StatusMon -up-> CmdDecoder : " Stall / Resume Pipeline"
+    
+    ' Xử lý Flush
+    FlushCoord -down-> P_GEM_CMD : " Inject FLUSH_CMD\n(Xóa L1 TLB Gemmini)"
+    FlushCoord -right-> P_MMU_CFG : " Broadcast Flush\n(Xóa L2 MMU)"
+
+    ' Quản lý Response / Counter / Writeback
+    P_GEM_RESP -down-> WBArbiter : " COUNTER_OP Data"
+    WBArbiter -up-> P_HOST_RESP : " Return rd to CPU"
+}
+
+' ==========================================
+' EXTERNAL CONNECTIONS
+' ==========================================
+P_HOST_CMD -down-> InstBuf : " RoCC Command Stream"
+P_GEM_BUSY -up-> StatusMon
+
+@enduml
