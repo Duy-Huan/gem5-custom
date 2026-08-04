@@ -1,0 +1,123 @@
+@startuml
+skinparam componentStyle uml2
+skinparam linetype ortho
+skinparam shadowing false
+skinparam defaultFontName sans-serif
+skinparam defaultTextAlignment center
+skinparam nodesep 50
+skinparam ranksep 40
+
+' Định dạng khung ngoài của Accelerator
+skinparam package {
+    BackgroundColor Transparent
+    BorderColor #333333
+    BorderThickness 2
+    FontSize 18
+    FontStyle bold
+}
+
+' Định dạng các Sub-module lớn
+skinparam rectangle {
+    RoundCorner 8
+    BorderThickness 1.5
+    BorderColor #555555
+    FontSize 15
+    FontStyle bold
+}
+
+' Định dạng các khối linh kiện
+skinparam component {
+    RoundCorner 4
+    BorderThickness 1
+    BorderColor #777777
+    BackgroundColor #FFFFFF
+    FontSize 14
+}
+
+' ==========================================
+' EXTERNAL INTERFACES (Cổng giao tiếp hệ thống)
+' ==========================================
+interface "io.cmd\n(Từ AuRORA Manager)" as P_CMD #F4B183
+interface "io.busy\n(Tới AuRORA Manager)" as P_BUSY #FF7F50
+interface "io.resp\n(Tới AuRORA Manager)" as P_RESP #F4B183
+
+interface "io.ptw\n(Tới Hardware MMU)" as P_PTW #F4B183
+interface "io.mem\n(TileLink DMA Interconnect)" as P_MEM #F4B183
+
+' ==========================================
+' GEMMINI ACCELERATOR INTERNAL STRUCTURE
+' ==========================================
+package "Gemmini Accelerator" {
+
+    ' Khối Điều khiển Frontend (Controller)
+    rectangle "Controller & Frontend" as CTRL #E8F8F5 {
+        component "Loop Unroller\n(Sinh Micro-ops / Decode)" as Unroller
+        
+        component "Reservation Station\n(ld_q | ex_q | st_q)" as DepMgmt
+        
+        component "DMA Engine\n(Load / Store Ctrl)" as DMA
+        component "Local TLB\n(Shared, Size=4)" as L1TLB
+        
+        Unroller -down-> DepMgmt : " Push Micro-ops"
+        DepMgmt -down-> DMA : " Issue Load/Store"
+        DMA <-right-> L1TLB : " VA -> PA"
+        
+        ' Tín hiệu Flush L1 TLB khi nhận FLUSH_CMD từ Manager
+        Unroller -right-> L1TLB : " Flush (SFENCE.VMA)"
+    }
+
+    ' Khối Tính toán (Execution Engine)
+    rectangle "Execution Engine" as ENGINE #FCF3CF {
+        component "Transposer" as Transposer
+        component "Systolic Array\n(16x16 PEs)" as Mesh
+        
+        Transposer -down-> Mesh : " Dataflow"
+    }
+
+    ' Khối Bộ nhớ cục bộ (Storage & Formatting)
+    rectangle "Local Storage / Memory" as STORAGE #EAECEE {
+        component "Scratchpad\n(Bank 0 ... Bank K)" as SPAD
+        
+        rectangle "Accumulator Subsystem" as ACC_SUB #FFFFFF {
+            component "Accumulator SRAM" as ACC
+            component "ReLU (Activation)" as RELU
+            component "Scaling" as SCALE
+            
+            ACC -right-> RELU : " Đọc (Compute/Store)"
+            RELU -right-> SCALE
+        }
+    }
+
+    ' ------------------------------------------
+    ' INTERNAL ROUTING (Luồng dữ liệu & Điều khiển)
+    ' ------------------------------------------
+    
+    ' Lệnh Execute
+    DepMgmt -right-> Transposer : " Issue Ex"
+    
+    ' Luồng DMA Load (mvin)
+    DMA -down-> SPAD : " mvin (A,B)"
+    DMA -down-> ACC : " mvin (D)"
+    
+    ' Luồng DMA Store (mvout)
+    SCALE -up-> DMA : " mvout Pipeline"
+    SPAD -up-> DMA : " mvout"
+    
+    ' Luồng Systolic Array (Execute)
+    Mesh <-left-> SPAD : " Đọc Operands A, B\n Ghi/Đọc kết quả"
+    Mesh <-down-> ACC : " Đọc/Ghi Partial Sums"
+
+    ' Luồng giám sát trạng thái về Manager
+    DepMgmt -up-> P_BUSY : " Compute/Q Busy"
+    Unroller -up-> P_BUSY : " Unroll Busy"
+    DepMgmt -up-> P_RESP : " COUNTER_OP"
+}
+
+' ==========================================
+' EXTERNAL CONNECTIONS (Đi dây ra ngoài)
+' ==========================================
+P_CMD -down-> Unroller : " Lệnh RoCC"
+L1TLB -up-> P_PTW : " TLB Miss / Walk"
+DMA -up-> P_MEM : " TileLink Req/Resp (Trực tiếp RAM/L2)"
+
+@enduml
