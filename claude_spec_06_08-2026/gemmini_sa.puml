@@ -1,0 +1,140 @@
+@startuml
+skinparam componentStyle uml2
+skinparam linetype ortho
+skinparam shadowing false
+skinparam defaultFontName sans-serif
+skinparam defaultTextAlignment center
+skinparam nodesep 50
+skinparam ranksep 40
+
+' Định dạng khung ngoài của Accelerator
+skinparam package {
+    BackgroundColor Transparent
+    BorderColor #333333
+    BorderThickness 2
+    FontSize 18
+    FontStyle bold
+}
+
+' Định dạng các Sub-module lớn
+skinparam rectangle {
+    RoundCorner 8
+    BorderThickness 1.5
+    BorderColor #555555
+    FontSize 15
+    FontStyle bold
+}
+
+' Định dạng các khối linh kiện
+skinparam component {
+    RoundCorner 4
+    BorderThickness 1
+    BorderColor #777777
+    BackgroundColor #FFFFFF
+    FontSize 14
+}
+
+' ==========================================
+' EXTERNAL INTERFACES
+' ==========================================
+interface "io.cmd\n(RoCC Command)" as P_CMD #F4B183
+interface "io.busy\n(Aggregated Busy Status)" as P_BUSY #FF7F50
+interface "io.resp\n(Counter Writeback rd)" as P_RESP #F4B183
+
+interface "io.ptw\n(L1 TLB Miss Walk)" as P_PTW #F4B183
+interface "io.mem\n(TileLink DMA)" as P_MEM #F4B183
+
+' ==========================================
+' GEMMINI ACCELERATOR INTERNAL STRUCTURE
+' ==========================================
+package "Gemmini Accelerator" {
+
+    ' Khối Điều khiển Frontend (Controller)
+    rectangle "Controller & Frontend" as CTRL #E8F8F5 {
+        component "Loop Unroller\n(Command Dispatcher)" as Unroller
+        
+        component "Reservation Station\n(ld_q | ex_q | st_q\n+ Dependency Logic)" as DepMgmt
+        
+        component "DMA Engine\n(Load/Store Controllers)" as DMA
+        component "Local L1 TLB\n(Shared Size=4)" as L1TLB
+        
+        Unroller -down-> DepMgmt : " Push Micro-ops"
+        DepMgmt -down-> DMA : " Issue Load/Store"
+        DMA <-right-> L1TLB : " VA -> PA Translation"
+        
+        ' Flush L1 TLB - day la lenh FLUSH_CMD binh thuong trong ISA
+        ' Gemmini (Controller.scala), PHAI do PHAN MEM chu dong phat
+        ' qua io.cmd, KHONG phai Manager tu inject. Doi ten tu
+        ' "SFENCE.VMA" (thuat ngu RISC-V, dung cho PTW tang 2 cua
+        ' Manager) sang ten dung de tranh nham voi manager_sa.puml.
+        ' Nguon phat cung la tu top-level Controller (raw_cmd stage),
+        ' khong phai rieng "Loop Unroller" (Unroller chi xu ly
+        ' LOOP_WS*/LOOP_CONV_WS*).
+        P_CMD -right-> L1TLB : " FLUSH_CMD (funct rieng)\ntlb.io.exp.flush()\n[TANG 1 - doc lap voi\nSFENCE tang 2 cua Manager]"
+    }
+
+    ' Khối Tính toán & Biến đổi (Execution & Transposer)
+    rectangle "Execution & Data Transformation" as ENGINE #FCF3CF {
+        component "Transposer Unit\n(Matrix Reordering)" as Transposer
+        component "Systolic Array\n(16x16 PEs Mesh)" as Mesh
+    }
+
+    ' Khối Bộ nhớ cục bộ (Storage & Formatting Pipeline)
+    rectangle "Local Storage & Pipelines" as STORAGE #EAECEE {
+        component "Scratchpad SRAM\n(Bank 0 ... Bank K)" as SPAD
+        
+        rectangle "Accumulator Subsystem" as ACC_SUB #FFFFFF {
+            component "Accumulator SRAM\n(Partial Sums D)" as ACC
+            component "ReLU Activation" as RELU
+            component "Scaling Unit" as SCALE
+            
+            ACC -right-> RELU : " Pipeline Read"
+            RELU -right-> SCALE
+        }
+    }
+
+    ' ------------------------------------------
+    ' INTERNAL ROUTING (Đường đi dữ liệu tinh chỉnh)
+    ' ------------------------------------------
+    
+    ' Lệnh Execute đi xuống Systolic Array
+    DepMgmt -right-> Mesh : " Issue Execute Ops"
+    
+    ' Transposer hỗ trợ luồng dữ liệu vào Scratchpad / Array
+    SPAD <--> Transposer : " Data Reordering"
+    Transposer --> Mesh
+    
+    ' Luồng DMA Load (mvin) rẽ nhánh linh hoạt
+    DMA -down-> SPAD : " mvin -> Scratchpad (A,B)"
+    DMA -down-> ACC : " mvin -> Accumulator (D)"
+    
+    ' Luồng DMA Store (mvout) qua Pipeline ReLU/Scaling
+    SCALE -up-> DMA : " mvout (Processed Data)"
+    SPAD -up-> DMA : " mvout (Raw Data)"
+    
+    ' Luồng Systolic Array tính toán với Bộ nhớ
+    Mesh <-left-> SPAD : " Read Operands A, B"
+    Mesh <-down-> ACC : " Read/Write Partial Sums D"
+
+    ' Tổng hợp tín hiệu Trạng thái (io.busy logic)
+    Unroller -up-> P_BUSY : " Unroller Active"
+    DepMgmt -up-> P_BUSY : " Queues / Solitary Preload"
+    DMA -up-> P_BUSY : " DMA In-flight"
+    DepMgmt -up-> P_RESP : " COUNTER_OP Result"
+}
+
+' ==========================================
+' EXTERNAL CONNECTIONS
+' ==========================================
+P_CMD -down-> Unroller : " RoCC Cmd Stream"
+L1TLB -up-> P_PTW : " TLB Miss / PTW"
+note right of P_PTW
+  Ben nhan (Manager's Mgr_MMU, xem manager_sa.puml) NEN
+  tai su dung gem5 arch::riscv::Walker (co san WalkerPort
+  + multi-outstanding) nhung can adapter thay the
+  ThreadContext that (Manager dung shadow ptbr, khong co
+  ThreadContext song) - xem note trong manager_sa.puml.
+end note
+DMA -up-> P_MEM : " TileLink Requests"
+
+@enduml

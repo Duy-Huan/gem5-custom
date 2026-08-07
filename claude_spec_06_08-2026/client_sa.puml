@@ -1,0 +1,109 @@
+@startuml
+skinparam componentStyle uml2
+skinparam linetype ortho
+skinparam shadowing false
+skinparam defaultFontName sans-serif
+skinparam defaultTextAlignment center
+skinparam nodesep 50
+skinparam ranksep 40
+
+' Định dạng khung ngoài Client Subsystem
+skinparam package {
+    BackgroundColor Transparent
+    BorderColor #333333
+    BorderThickness 2
+    FontSize 18
+    FontStyle bold
+}
+
+' Định dạng các Sub-module lớn
+skinparam rectangle {
+    RoundCorner 8
+    BorderThickness 1.5
+    BorderColor #555555
+    FontSize 15
+    FontStyle bold
+}
+
+' Định dạng các khối linh kiện chi tiết
+skinparam component {
+    RoundCorner 4
+    BorderThickness 1
+    BorderColor #777777
+    BackgroundColor #FFFFFF
+    FontSize 14
+}
+
+' ==========================================
+' EXTERNAL INTERFACES
+' ==========================================
+interface "CPU Pipeline / RoCC\n(Custom Instructions)" as P_CPU_PIPE #F4B183
+interface "CPU Stall / Interlock\n(Flow Control)" as P_CPU_STALL #FF7F50
+interface "CPU Register File Writeback\n(rd / data)" as P_CPU_WB #F4B183
+interface "System Interconnect / NoC\n(RoCC Packets to Manager)" as P_SYS_BUS #F4B183
+
+' ==========================================
+' CLIENT TRACKER INTERNAL STRUCTURE
+' ==========================================
+package "AuRORA Client Tracker (Host Side)" {
+
+    ' Khối Giao tiếp & Giải mã lệnh phía CPU
+    rectangle "CPU Front-End Interface" as CPU_FE #E8F8F5 {
+        component "RoCC Instruction Queue\n(Command Buffer)" as CmdBuf
+        component "RoCC Decoder &\nPacket Formatter" as Dispatcher
+        
+        CmdBuf -down-> Dispatcher : " Raw RoCC Op"
+    }
+
+    ' Khoi Theo doi Task & Ngu canh - SUA: KHONG phai bang Transaction-ID,
+    ' RTL that dung 16 credit pool doc lap theo cfg + 1 FSM dieu khien
+    ' dung chung (Client.scala:15,85-93,107). Response match theo FIFO
+    ' order trong tung cfg, KHONG tag-match theo transaction ID.
+    rectangle "Task & Context Tracking Engine" as TRACKER #FCF3CF {
+        component "Per-cfg Credit Pools\n(16x cfg_credits, depth=4/pool)\n[KHONG phai Transaction-ID table]" as TxTracker
+        component "Client Context Register\n(16x cfg[acq|mgr_id] +\n4x RROPC opcode-routing slot)" as TenantState
+        component "Shared Control FSM\n(cfg_acq_state: acquire/release/\nstatus/ptbr - DUNG CHUNG ca 16 cfg)" as SyncMgr
+    }
+
+    ' Khối Xử lý Phản hồi & Writeback
+    rectangle "Response & Writeback Logic" as WB_ENG #EAECEE {
+        component "Response Unpacker\n& FIFO" as RespFIFO
+        component "Register File Arbiter\n(Writeback Controller)" as WBArbiter
+        
+        RespFIFO -right-> WBArbiter
+    }
+
+    ' ------------------------------------------
+    ' INTERNAL ROUTING (Đường điều khiển nội bộ)
+    ' ------------------------------------------
+    Dispatcher -down-> TxTracker : " cfg_credits(cfg_id)--\n(chi khi credit>0 && cfg.acq)"
+    Dispatcher -right-> P_SYS_BUS : " Marshal & Send Packet\n(to AuRORA Manager)"
+
+    ' SUA: dieu kien stall that la credit==0 HOAC cfg_acq_state!=s_idle
+    ' (FSM dung chung chan TAT CA cfg - head-of-line blocking tiem an).
+    ' Dieu kien FENCE that KHONG PHAI "Pending Count==0" cuc bo - phai
+    ' doi sUnbusyAck round-trip TU MANAGER (io.busy accel==0 &&
+    ' inst_q.count==0), khong tu quyet dinh duoc o Client.
+    SyncMgr -up-> P_CPU_STALL : " Assert Stall\n(credit==0 HOAC\ncfg_acq_state != s_idle)"
+    TxTracker -right-> SyncMgr : " credit_available &&\nstatus_ready && ptbr_ready"
+    SyncMgr -up-> Dispatcher : " Resume Pipeline"
+    note bottom of SyncMgr
+      rerocc_fence THAT: ghi CSR RRBAR -> gui
+      mUnbusy -> CHO sUnbusyAck tu Manager
+      (round-trip qua NoC, khong phai check
+      gia tri cuc bo). Xem aurora_sequence_v4
+      buoc 7.
+    end note
+
+    ' Response match theo THU TU FIFO cua tung cfg, KHONG tag-match
+    P_SYS_BUS -down-> RespFIFO : " sWrite (2-beat: data,rd)\n[CHI khi accelerator tu assert\nio.resp.valid - vd Gemmini\nCOUNTER_OP; da so lenh khac\n(mvin/mvout/compute...) KHONG\nco writeback nao ca]"
+    WBArbiter -up-> P_CPU_WB : " Writeback rd"
+}
+
+' ==========================================
+' EXTERNAL CONNECTIONS
+' ==========================================
+P_CPU_PIPE -down-> CmdBuf : " RoCC Cmd"
+P_SYS_BUS -up-> TxTracker : " credit_return (sInstAck)\n[KHONG PHAI 'response match theo ID']"
+
+@enduml

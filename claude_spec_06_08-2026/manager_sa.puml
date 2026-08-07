@@ -1,0 +1,162 @@
+@startuml
+skinparam componentStyle uml2
+skinparam linetype ortho
+skinparam shadowing false
+skinparam defaultFontName sans-serif
+skinparam defaultTextAlignment center
+skinparam nodesep 50
+skinparam ranksep 40
+
+' Định dạng khung ngoài Manager
+skinparam package {
+    BackgroundColor Transparent
+    BorderColor #333333
+    BorderThickness 2
+    FontSize 18
+    FontStyle bold
+}
+
+' Định dạng các Sub-module lớn
+skinparam rectangle {
+    RoundCorner 8
+    BorderThickness 1.5
+    BorderColor #555555
+    FontSize 15
+    FontStyle bold
+}
+
+' Định dạng các khối linh kiện chi tiết
+skinparam component {
+    RoundCorner 4
+    BorderThickness 1
+    BorderColor #777777
+    BackgroundColor #FFFFFF
+    FontSize 14
+}
+
+' ==========================================
+' EXTERNAL INTERFACES
+' ==========================================
+' 1. Giao tiếp phía Host CPU
+' SUA (2 lan review truoc bo sot): Manager KHONG BAO GIO noi truc tiep
+' toi CPU. Day la ban chat "Re-RoCC" = disaggregate khoi CPU. Port ngoai
+' duy nhat huong ve phia Client la 1 cong ReRoCC qua NoC (rr_req in /
+' rr_resp out, Manager.scala), mang ca 6 loai message (mAcquire/mInst/
+' mUStatus/mUPtbr/mRelease/mUnbusy in; sAcqResp/sInstAck/sWrite/sRelResp/
+' sUnbusyAck out) - KHONG PHAI 1 duong "RoCC Cmd tu CPU" rieng.
+interface "ReRoCC NoC Port\n(ResponsePort - nhan mAcquire/mInst/\nmUStatus/mUPtbr/mRelease/mUnbusy)" as P_NOC_REQ #4A90E2
+interface "ReRoCC NoC Port\n(gui sAcqResp/sInstAck/sWrite/\nsRelResp/sUnbusyAck ve Client)" as P_NOC_RESP #50E3C2
+
+' SUA: PTW la SUBMODULE NOI BO cua Manager (Manager.scala: val ptw =
+' Module(new PTW(...))), KHONG PHAI 1 external interface. Chuyen thanh
+' component noi bo trong package ben duoi (xem Mgr_MMU).
+
+' 3. Giao tiếp phía Gemmini Accelerator
+interface "io.cmd\n(Tới Gemmini Unroller)" as P_GEM_CMD #F4B183
+interface "io.busy\n(Từ Gemmini Status)" as P_GEM_BUSY #FF7F50
+interface "io.resp\n(Từ Gemmini Counter)" as P_GEM_RESP #F4B183
+
+' 4. Port bo nho THAT cua Manager (PTW walk + accelerator mem traffic
+' di CHUNG qua tlNode - Manager.scala:213, xem review doc muc 1.1)
+interface "Manager tlNode\n(RequestPort -> SoC Interconnect)" as P_SYS_MEM #9B59B6
+
+' ==========================================
+' AURORA MANAGER INTERNAL STRUCTURE
+' ==========================================
+package "AuRORA Manager Subsystem" {
+
+    ' Khối Giao tiếp & Giải mã lệnh Frontend
+    rectangle "Frontend & Command Decoder" as FRONTEND #E8F8F5 {
+        component "Instruction Buffer\n(Depth=4 FIFO)" as InstBuf
+        component "RoCC Command Decoder\n& Dispatcher" as CmdDecoder
+        
+        InstBuf -down-> CmdDecoder : " Raw RoCC Cmd"
+    }
+
+    ' Khối Quản lý Ngữ cảnh & Đồng bộ Trạng thái (Control Plane)
+    rectangle "Context & Synchronization Engine" as CTX_ENG #FCF3CF {
+        component "Tenant Context Manager\n(ASID / PTBR Tracker,\nShadow Regs status+ptbr)" as CtxMgr
+        component "Fence & Status Monitor\n(io.busy Sampler)" as StatusMon
+        component "SFENCE / Flush Coordinator\n(TLB Invalidation)" as FlushCoord
+    }
+
+    ' MMU la SUBMODULE NOI BO (Manager.scala: val ptw = Module(new PTW(...)))
+    rectangle "MMU Subsystem" as MMU_ENG #D5F5E3 {
+        component "PTW (rocket-chip)\n+ optional L2TLB/PTECache\n(default 0 entries, xem review doc)" as Mgr_MMU
+    }
+    note bottom of Mgr_MMU
+      GOI Y TAI SU DUNG gem5 (pagetable_walker.hh:64):
+      arch::riscv::Walker la ClockedObject co san, co
+      WalkerPort (RequestPort) + ho tro NHIEU outstanding
+      walk cung luc - phu hop truc tiep cho nhu cau nay.
+      NHUNG: Walker::start(ThreadContext* _tc, ...) BAT
+      BUOC 1 ThreadContext THAT de doc satp/ptbr - Manager
+      chi co "shadow ptbr" (1 gia tri nhan qua NoC, khong
+      co ThreadContext song). CAN 1 lop adapter/proxy
+      ThreadContext moi de tai su dung Walker nguyen ban,
+      hoac subclass de bypass buoc doc tu ThreadContext.
+    end note
+
+    ' Khối Định tuyến Phản hồi (Response Router)
+    rectangle "Response & Writeback Logic" as RESP_ENG #EAECEE {
+        component "Writeback Arbiter\n(Counter / Status)" as WBArbiter
+    }
+
+    ' ------------------------------------------
+    ' INTERNAL ROUTING (Đường điều khiển nội bộ)
+    ' ------------------------------------------
+    
+    ' Phân phối lệnh từ Decoder
+    CmdDecoder -down-> CtxMgr : " mUStatus/mUPtbr\n(Shadow Regs update)"
+    CmdDecoder -down-> P_GEM_CMD : " Forward mInst -> io.cmd\n(Standard Ops)"
+    ' LUU Y: FlushCoord KHONG duoc trigger boi CmdDecoder giai ma tu
+    ' command stream - no la HE QUA TU DONG cua state machine noi bo
+    ' Manager khi xu ly mRelease (s_rel_wait -> s_sfence -> s_idle),
+    ' xem Manager.scala:174-184. Khong co opcode "SFENCE" nao trong
+    ' ReRoCCProtocol de "catch" ca (chi co 6 opcode: mAcquire/mInst/
+    ' mUStatus/mUPtbr/mRelease/mUnbusy).
+    CtxMgr -down-> FlushCoord : " state==s_rel_wait\n&& !io.busy && inst_q.count==0\n-> tu dong chuyen s_sfence"
+
+    ' Cập nhật cấu hình sang Hardware MMU
+    CtxMgr -right-> Mgr_MMU : " Cap nhat shadow ptbr (noi bo,\nkhong qua external port)"
+
+    ' Quản lý Fence & Busy
+    P_GEM_BUSY -up-> StatusMon : " Poll io.busy"
+    StatusMon -up-> CmdDecoder : " Stall / Resume Pipeline"
+    
+    ' Xu ly Flush - CHI xoa L2/PTW cua CHINH Manager (SFENCE noi bo,
+    ' tu dong khi hoan tat rerocc_release qua state s_sfence).
+    ' KHONG co duong nao trong RTL (Manager.scala) inject lenh vao
+    ' io.cmd cua accelerator ngoai duong inst_q binh thuong tu Client.
+    FlushCoord -right-> Mgr_MMU : " Trigger PTW.sfence.valid (noi bo)\n(Xoa L2 MMU CUA MANAGER,\ntu dong khi state s_rel_wait->s_sfence)"
+    note right of FlushCoord
+      KHONG inject FLUSH_CMD vao Gemmini.
+      L1 TLB cua Gemmini (FrontendTLB) la
+      mot co che HOAN TOAN DOC LAP, chi duoc
+      xoa khi PHAN MEM tu phat lenh FLUSH_CMD
+      qua duong io.cmd binh thuong (xem
+      gemmini_sa.puml). Neu firmware quen
+      phat FLUSH_CMD truoc khi release, TLB
+      noi bo Gemmini co the giu translation
+      cu tu tenant truoc (FrontendTLB.scala:56
+      tlb.io.sfence.bits.asid := DontCare -
+      TLB nay KHONG gan ASID per-entry) ->
+      RUI RO CACH LY DA-TENANT can dua vao
+      security review truoc tape-out.
+    end note
+
+    ' Quản lý Response / Counter / Writeback
+    P_GEM_RESP -down-> WBArbiter : " COUNTER_OP Data"
+    WBArbiter -up-> P_NOC_RESP : " sWrite (2-beat: data,rd) qua NoC ve Client\n- Client MOI la noi ghi rd vao CPU regfile"
+}
+
+' ==========================================
+' EXTERNAL CONNECTIONS
+' ==========================================
+P_NOC_REQ -down-> InstBuf : " Giai ma tung opcode (mAcquire/mInst/...)\n- KHONG PHAI 1 luong RoCC Cmd don gian"
+P_GEM_BUSY -up-> StatusMon
+
+
+Mgr_MMU -down-> P_SYS_MEM : " PTW page-table-walk request\n(di CHUNG duong voi accelerator\nmemory traffic qua tlNode/xbar)"
+
+@enduml
